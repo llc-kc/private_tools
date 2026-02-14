@@ -1,0 +1,463 @@
+From 994628cab44f1109585b6852f0905f73452c1d14 Mon Sep 17 00:00:00 2001
+From: Vladislav Nosivskoy <vladnosiv@gmail.com>
+Date: Wed, 11 Feb 2026 23:28:36 +0300
+Subject: [PATCH] feat: support l3 for dsv32
+
+Signed-off-by: Vladislav Nosivskoy <vladnosiv@gmail.com>
+---
+ .../sglang/srt/managers/cache_controller.py   | 100 +++++++++++++++
+ .../sglang/srt/mem_cache/hicache_storage.py   |  36 ++++++
+ python/sglang/srt/mem_cache/hiradix_cache.py  |  16 +++
+ .../sglang/srt/mem_cache/memory_pool_host.py  |  60 +++++++++
+ .../storage/mooncake_store/mooncake_store.py  | 115 ++++++++++++++++++
+ 5 files changed, 327 insertions(+)
+
+diff --git a/python/sglang/srt/managers/cache_controller.py b/python/sglang/srt/managers/cache_controller.py
+index 845dffe96496..f36087d49250 100644
+--- a/python/sglang/srt/managers/cache_controller.py
++++ b/python/sglang/srt/managers/cache_controller.py
+@@ -41,6 +41,7 @@
+     is_dp_attention_enabled,
+ )
+ from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
++from sglang.srt.mem_cache.memory_pool_host import NSATokenToKVPoolHost
+ from sglang.srt.utils import get_device_module
+ 
+ logger = logging.getLogger(__name__)
+@@ -479,6 +480,20 @@ def attach_storage_backend(
+                 self.page_get_func = self._page_get_zero_copy
+                 self.page_set_func = self._page_set_zero_copy
+ 
++            self.nsa_extra_supported = isinstance(
++                self.mem_pool_host, NSATokenToKVPoolHost
++            ) and all(
++                hasattr(self.storage_backend, fn)
++                for fn in (
++                    "batch_get_extra",
++                    "batch_set_extra",
++                    "batch_exists_extra",
++                )
++            )
++            if self.nsa_extra_supported:
++                self.page_get_func = self._page_get_nsa_extra
++                self.page_set_func = self._page_set_nsa_extra
++
+             # Ensure stop_event is clear before starting threads.
+             self.storage_stop_event.clear()
+             self._start_storage_threads()
+@@ -511,6 +526,7 @@ def attach_storage_backend(
+             self.enable_storage = False
+             self.page_get_func = self._generic_page_get
+             self.page_set_func = self._generic_page_set
++            self.nsa_extra_supported = False
+             raise
+ 
+     def detach_storage_backend(self):
+@@ -563,6 +579,7 @@ def detach_storage_backend(self):
+         self.enable_storage = False
+         self.page_get_func = self._generic_page_get
+         self.page_set_func = self._generic_page_set
++        self.nsa_extra_supported = False
+         # Now it's safe to clear the stop event for future re-attach.
+         self.storage_stop_event.clear()
+ 
+@@ -802,6 +819,84 @@ def _page_get_zero_copy(
+             inc += self.page_size
+         operation.increment(inc)
+ 
++    @staticmethod
++    def _count_consecutive_true(results: List[bool]) -> int:
++        for i, ok in enumerate(results):
++            if not ok:
++                return i
++        return len(results)
++
++    def _kv_get_pages(self, hash_values, host_indices, extra_info=None) -> int:
++        if self.storage_backend_type == "mooncake":
++            results = self.storage_backend.batch_get_v1(
++                hash_values, host_indices, extra_info
++            )
++            return self._count_consecutive_true(results)
++
++        dummy_page_dst = [
++            self.mem_pool_host.get_dummy_flat_data_page() for _ in hash_values
++        ]
++        page_data = self.storage_backend.batch_get(hash_values, dummy_page_dst)
++        if page_data is None:
++            return 0
++        success_pages = 0
++        for i in range(len(hash_values)):
++            if page_data[i] is None:
++                break
++            self.mem_pool_host.set_from_flat_data_page(
++                host_indices[i * self.page_size], page_data[i]
++            )
++            success_pages += 1
++        return success_pages
++
++    def _kv_set_pages(self, hash_values, host_indices, extra_info=None) -> bool:
++        if self.storage_backend_type == "mooncake":
++            return all(
++                self.storage_backend.batch_set_v1(hash_values, host_indices, extra_info)
++            )
++        data = [
++            self.mem_pool_host.get_data_page(host_indices[i * self.page_size])
++            for i in range(len(hash_values))
++        ]
++        return self.storage_backend.batch_set(hash_values, data)
++
++    def _page_get_nsa_extra(
++        self, operation, hash_values, host_indices, extra_info=None
++    ):
++        kv_pages = self._kv_get_pages(hash_values, host_indices, extra_info)
++        if kv_pages == 0:
++            return
++        num_pages = kv_pages
++        staging = torch.empty(
++            (
++                num_pages,
++                self.mem_pool_host.layer_num,
++                self.mem_pool_host.indexer_page_stride_size,
++            ),
++            dtype=self.mem_pool_host.indexer_dtype,
++            device=self.mem_pool_host.device,
++        )
++        buffers = [staging[i] for i in range(num_pages)]
++        results = self.storage_backend.batch_get_extra(
++            hash_values[:num_pages], buffers, extra_info
++        )
++        idx_pages = self._count_consecutive_true(results)
++        completed_pages = min(kv_pages, idx_pages)
++        if completed_pages > 0:
++            self.mem_pool_host.unpack_indexer_pages(
++                host_indices[: completed_pages * self.page_size],
++                staging[:completed_pages],
++            )
++        operation.increment(completed_pages * self.page_size)
++
++    def _page_set_nsa_extra(self, hash_values, host_indices, extra_info=None) -> bool:
++        if not self._kv_set_pages(hash_values, host_indices, extra_info):
++            return False
++        staging = self.mem_pool_host.pack_indexer_pages(host_indices)
++        buffers = [staging[i] for i in range(len(hash_values))]
++        results = self.storage_backend.batch_set_extra(hash_values, buffers, extra_info)
++        return all(results)
++
+     # todo: deprecate
+     def _generic_page_get(self, operation, hash_values, host_indices, extra_info=None):
+         dummy_page_dst = [
+@@ -898,6 +993,11 @@ def _storage_hit_query(self, operation) -> tuple[list[str], int]:
+                 batch_hashes.append(last_hash)
+             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+             hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
++            if getattr(self, "nsa_extra_supported", False):
++                hit_idx_num = self.storage_backend.batch_exists_extra(
++                    batch_hashes, extra_info
++                )
++                hit_page_num = min(hit_page_num, hit_idx_num)
+             hash_value.extend(batch_hashes[:hit_page_num])
+             storage_query_count += hit_page_num * self.page_size
+             if hit_page_num < len(batch_hashes):
+diff --git a/python/sglang/srt/mem_cache/hicache_storage.py b/python/sglang/srt/mem_cache/hicache_storage.py
+index 38df15262cc9..26ab6f2375a7 100644
+--- a/python/sglang/srt/mem_cache/hicache_storage.py
++++ b/python/sglang/srt/mem_cache/hicache_storage.py
+@@ -182,6 +182,7 @@ def get_stats(self):
+ 
+ 
+ class HiCacheFile(HiCacheStorage):
++    _NSA_INDEXER_SUFFIX = "__nsa_idx"
+ 
+     def __init__(
+         self, storage_config: HiCacheStorageConfig, file_path: str = "/tmp/hicache"
+@@ -271,6 +272,41 @@ def batch_set(
+                 return False
+         return True
+ 
++    def batch_get_extra(
++        self,
++        keys: List[str],
++        buffers: List[torch.Tensor],
++        extra_info: Optional[HiCacheStorageExtraInfo] = None,
++    ) -> List[bool]:
++        results = []
++        for key, buffer in zip(keys, buffers):
++            extra_key = f"{key}{self._NSA_INDEXER_SUFFIX}"
++            results.append(self.get(extra_key, target_location=buffer) is not None)
++        return results
++
++    def batch_set_extra(
++        self,
++        keys: List[str],
++        buffers: List[torch.Tensor],
++        extra_info: Optional[HiCacheStorageExtraInfo] = None,
++    ) -> List[bool]:
++        results = []
++        for key, buffer in zip(keys, buffers):
++            extra_key = f"{key}{self._NSA_INDEXER_SUFFIX}"
++            results.append(self.set(extra_key, value=buffer))
++        return results
++
++    def batch_exists_extra(
++        self,
++        keys: List[str],
++        extra_info: Optional[HiCacheStorageExtraInfo] = None,
++    ) -> int:
++        for i, key in enumerate(keys):
++            extra_key = f"{key}{self._NSA_INDEXER_SUFFIX}"
++            if not self.exists(extra_key):
++                return i
++        return len(keys)
++
+     def exists(self, key: str) -> bool:
+         key = self._get_suffixed_key(key)
+         tensor_path = os.path.join(self.file_path, f"{key}.bin")
+diff --git a/python/sglang/srt/mem_cache/hiradix_cache.py b/python/sglang/srt/mem_cache/hiradix_cache.py
+index 793eca10a3a2..9c2dcda1ce9a 100644
+--- a/python/sglang/srt/mem_cache/hiradix_cache.py
++++ b/python/sglang/srt/mem_cache/hiradix_cache.py
+@@ -66,6 +66,22 @@ def __init__(self, params: CacheInitParams, server_args: ServerArgs):
+         self.page_size = params.page_size
+         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
+ 
++        if (
++            isinstance(self.kv_cache, NSATokenToKVPool)
++            and server_args.hicache_storage_backend == "mooncake"
++            and server_args.hicache_mem_layout
++            not in ["page_first", "page_first_direct"]
++        ):
++            server_args.hicache_mem_layout = (
++                "page_first_direct"
++                if server_args.hicache_io_backend == "direct"
++                else "page_first"
++            )
++            logger.warning(
++                "Mooncake storage backend with NSA requires page_first layout, "
++                f"switching to {server_args.hicache_mem_layout}."
++            )
++
+         if isinstance(self.kv_cache, MHATokenToKVPool):
+             self.token_to_kv_pool_host = MHATokenToKVPoolHost(
+                 self.kv_cache,
+diff --git a/python/sglang/srt/mem_cache/memory_pool_host.py b/python/sglang/srt/mem_cache/memory_pool_host.py
+index ba969cda5054..b18fc00146fc 100644
+--- a/python/sglang/srt/mem_cache/memory_pool_host.py
++++ b/python/sglang/srt/mem_cache/memory_pool_host.py
+@@ -1186,3 +1186,63 @@ def backup_from_device_all_layer(
+         self._backup_indexer_from_device_all_layer(
+             device_pool, host_indices, device_indices, io_backend
+         )
++
++    def pack_indexer_pages(self, host_indices: torch.Tensor) -> torch.Tensor:
++        if host_indices.numel() == 0:
++            return torch.empty(
++                (0, self.layer_num, self.indexer_page_stride_size),
++                dtype=self.indexer_dtype,
++                device=self.device,
++            )
++        if host_indices.numel() % self.page_size != 0:
++            raise ValueError(
++                "Index buffer transfer expects page-aligned indices for NSA."
++            )
++        host_page_indices = (
++            host_indices.reshape(-1, self.page_size)[:, 0] // self.page_size
++        )
++        if host_page_indices.device.type != "cpu":
++            host_page_indices = host_page_indices.cpu()
++        staging = torch.empty(
++            (host_page_indices.numel(), self.layer_num, self.indexer_page_stride_size),
++            dtype=self.indexer_dtype,
++            device=self.device,
++        )
++        for layer_id in range(self.layer_num):
++            staging[:, layer_id, :] = self.index_k_with_scale_buffer[layer_id][
++                host_page_indices
++            ]
++        return staging
++
++    def unpack_indexer_pages(
++        self,
++        host_indices: torch.Tensor,
++        staging: torch.Tensor,
++        page_mask: Optional[torch.Tensor] = None,
++    ) -> None:
++        if host_indices.numel() == 0:
++            return
++        if host_indices.numel() % self.page_size != 0:
++            raise ValueError(
++                "Index buffer transfer expects page-aligned indices for NSA."
++            )
++        host_page_indices = (
++            host_indices.reshape(-1, self.page_size)[:, 0] // self.page_size
++        )
++        if host_page_indices.device.type != "cpu":
++            host_page_indices = host_page_indices.cpu()
++        if page_mask is not None:
++            if not torch.is_tensor(page_mask):
++                page_mask = torch.tensor(page_mask, dtype=torch.bool)
++            if page_mask.device.type != "cpu":
++                page_mask = page_mask.cpu()
++            host_page_indices = host_page_indices[page_mask]
++            staging = staging[page_mask]
++        if host_page_indices.numel() == 0:
++            return
++        if staging.device.type != "cpu":
++            staging = staging.cpu()
++        for layer_id in range(self.layer_num):
++            self.index_k_with_scale_buffer[layer_id][host_page_indices] = staging[
++                :, layer_id, :
++            ]
+diff --git a/python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_store.py b/python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_store.py
+index f661e73fafbb..0b1b8f8f3323 100644
+--- a/python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_store.py
++++ b/python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_store.py
+@@ -223,6 +223,7 @@ def load_from_extra_config(extra_config: dict) -> "MooncakeStoreConfig":
+ 
+ 
+ class MooncakeStore(HiCacheStorage):
++    _NSA_INDEXER_SUFFIX = "__nsa_idx"
+ 
+     def __init__(
+         self, storage_config: HiCacheStorageConfig = None, mem_pool: HostKVCache = None
+@@ -449,6 +450,41 @@ def _batch_preprocess(self, keys, host_indices):
+         else:
+             return self._get_mha_buffer_meta(keys, host_indices)
+ 
++    def _get_extra_keys(self, keys: List[str]) -> List[str]:
++        if self.is_mla_backend:
++            suffix = self.mla_suffix
++        else:
++            suffix = self.mha_suffix
++        if suffix:
++            return [f"{key}_{suffix}{self._NSA_INDEXER_SUFFIX}" for key in keys]
++        return [f"{key}{self._NSA_INDEXER_SUFFIX}" for key in keys]
++
++    def _register_staging_buffers(self, buffers: List[torch.Tensor]):
++        if not buffers:
++            return None
++        base_ptr = buffers[0].data_ptr()
++        last_buf = buffers[-1]
++        total_size = (
++            last_buf.data_ptr() - base_ptr
++        ) + last_buf.numel() * last_buf.element_size()
++        ret_code = self.store.register_buffer(base_ptr, total_size)
++        if ret_code:
++            logger.warning(
++                "Failed to register staging buffer for NSA indexer RDMA, "
++                "error code: %s",
++                ret_code,
++            )
++            return None
++        return base_ptr
++
++    def _unregister_staging_buffers(self, base_ptr):
++        """Unregister a previously registered staging buffer."""
++        if base_ptr is not None:
++            try:
++                self.store.unregister_buffer(base_ptr)
++            except Exception as e:
++                logger.warning("Failed to unregister staging buffer: %s", e)
++
+     def _batch_postprocess(self, results: List[int], is_set_operate=False):
+         """
+         refer to https://github.com/kvcache-ai/Mooncake/blob/main/mooncake-store/include/pybind_client.h
+@@ -487,6 +523,29 @@ def batch_get_v1(
+         )
+         return self._batch_postprocess(get_results, is_set_operate=False)
+ 
++    def batch_get_extra(
++        self,
++        keys: List[str],
++        buffers: List[torch.Tensor],
++        extra_info: Optional[HiCacheStorageExtraInfo] = None,
++    ) -> List[bool]:
++        if self.extra_backend_tag is not None:
++            prefix = self.extra_backend_tag
++            keys = [f"{prefix}_{key}" for key in keys]
++        key_strs = self._get_extra_keys(keys)
++        buffer_ptrs = [buf.data_ptr() for buf in buffers]
++        buffer_sizes = [buf.numel() * buf.element_size() for buf in buffers]
++        # Register staging memory for RDMA (staging tensor is not in
++        # Mooncake-registered memory by default).
++        base_ptr = self._register_staging_buffers(buffers)
++        try:
++            get_results = self._get_batch_zero_copy_impl(
++                key_strs, buffer_ptrs, buffer_sizes
++            )
++        finally:
++            self._unregister_staging_buffers(base_ptr)
++        return [res > 0 for res in get_results]
++
+     def batch_set_v1(
+         self,
+         keys: List[str],
+@@ -525,6 +584,49 @@ def batch_set_v1(
+ 
+         return self._batch_postprocess(set_results, is_set_operate=True)
+ 
++    def batch_set_extra(
++        self,
++        keys: List[str],
++        buffers: List[torch.Tensor],
++        extra_info: Optional[HiCacheStorageExtraInfo] = None,
++    ) -> List[bool]:
++        if self.extra_backend_tag is not None:
++            prefix = self.extra_backend_tag
++            keys = [f"{prefix}_{key}" for key in keys]
++        key_strs = self._get_extra_keys(keys)
++        buffer_ptrs = [buf.data_ptr() for buf in buffers]
++        buffer_sizes = [buf.numel() * buf.element_size() for buf in buffers]
++        exist_result = self._batch_exist(key_strs)
++
++        set_keys = []
++        set_buffer_ptrs = []
++        set_buffer_sizes = []
++        set_indices = []
++        set_results = [-1] * len(key_strs)
++        for i in range(len(key_strs)):
++            if exist_result[i] != 1:
++                set_keys.append(key_strs[i])
++                set_buffer_ptrs.append(buffer_ptrs[i])
++                set_buffer_sizes.append(buffer_sizes[i])
++                set_indices.append(i)
++            else:
++                set_results[i] = 0
++
++        if len(set_keys) > 0:
++            # Register staging memory for RDMA (staging tensor is not in
++            # Mooncake-registered memory by default).
++            base_ptr = self._register_staging_buffers(buffers)
++            try:
++                put_results = self._put_batch_zero_copy_impl(
++                    set_keys, set_buffer_ptrs, set_buffer_sizes
++                )
++            finally:
++                self._unregister_staging_buffers(base_ptr)
++            for i in range(len(set_indices)):
++                set_results[set_indices[i]] = put_results[i]
++
++        return [res == 0 for res in set_results]
++
+     def set(
+         self,
+         key,
+@@ -670,6 +772,19 @@ def batch_exists(
+                 return i // key_multiplier
+         return len(query_keys) // key_multiplier
+ 
++    def batch_exists_extra(
++        self, keys, extra_info: Optional[HiCacheStorageExtraInfo] = None
++    ) -> int:
++        if self.extra_backend_tag is not None:
++            prefix = self.extra_backend_tag
++            keys = [f"{prefix}_{key}" for key in keys]
++        query_keys = self._get_extra_keys(keys)
++        exist_result = self._batch_exist(query_keys)
++        for i in range(len(query_keys)):
++            if exist_result[i] != 1:
++                return i
++        return len(query_keys)
++
+     def close(self):
+         # MooncakeDistributedStore will automatically call the destructor, so
+         # it is unnecessary to close it manually.
